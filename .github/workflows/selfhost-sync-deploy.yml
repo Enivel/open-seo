@@ -1,0 +1,127 @@
+name: Sync Upstream & Deploy to Cloudflare
+
+on:
+  schedule:
+    # Daily at 03:00 UTC (11:00 CST)
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+    inputs:
+      force_deploy:
+        description: "Deploy even if there are no new upstream commits"
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: selfhost-sync-deploy
+  cancel-in-progress: false
+
+jobs:
+  sync-and-deploy:
+    if: github.repository == 'Enivel/open-seo'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Sync from every-app/open-seo
+        id: sync
+        run: |
+          git remote add upstream https://github.com/every-app/open-seo.git || true
+          git fetch upstream main
+          NEW_COMMITS=$(git rev-list HEAD..upstream/main --count)
+          echo "new_commits=$NEW_COMMITS" >> "$GITHUB_OUTPUT"
+          if [ "$NEW_COMMITS" -gt 0 ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git merge upstream/main --no-edit
+            git push origin HEAD:main
+            echo "Synced $NEW_COMMITS new commit(s) from upstream/main."
+          else
+            echo "Already up to date with upstream/main."
+          fi
+
+      - name: Check if deploy should run
+        id: should_deploy
+        run: |
+          if [ "${{ steps.sync.outputs.new_commits }}" -gt 0 ] || [ "${{ github.event_name == 'workflow_dispatch' && inputs.force_deploy }}" = "true" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Setup pnpm
+        if: steps.should_deploy.outputs.run == 'true'
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        if: steps.should_deploy.outputs.run == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Validate required secrets
+        if: steps.should_deploy.outputs.run == 'true'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          DATAFORSEO_API_KEY: ${{ secrets.DATAFORSEO_API_KEY }}
+        run: |
+          if [ -z "$CLOUDFLARE_API_TOKEN" ]; then
+            echo "::error::Missing secret CLOUDFLARE_API_TOKEN"
+            exit 1
+          fi
+          if [ -z "$DATAFORSEO_API_KEY" ]; then
+            echo "::error::Missing secret DATAFORSEO_API_KEY"
+            exit 1
+          fi
+
+      - name: Install dependencies
+        if: steps.should_deploy.outputs.run == 'true'
+        run: pnpm install --frozen-lockfile
+
+      - name: Write .env.selfhost
+        if: steps.should_deploy.outputs.run == 'true'
+        env:
+          DATAFORSEO_API_KEY: ${{ secrets.DATAFORSEO_API_KEY }}
+          TREG_API_TOKEN: ${{ secrets.TREG_API_TOKEN }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          OPENROUTER_BASE_URL: ${{ secrets.OPENROUTER_BASE_URL }}
+          OPENROUTER_MODEL: ${{ secrets.OPENROUTER_MODEL }}
+          CONTEXT_API_KEY: ${{ secrets.CONTEXT_API_KEY }}
+          CRAWLER_ACCESS_SECRET: ${{ secrets.CRAWLER_ACCESS_SECRET }}
+          OPENSEO_OPERATOR_SECRET: ${{ secrets.OPENSEO_OPERATOR_SECRET }}
+        run: |
+          cat > .env.selfhost <<EOF
+          AUTH_MODE=password
+          CUSTOM_DOMAIN=seo.kepo.ai
+          DATAFORSEO_API_KEY=${DATAFORSEO_API_KEY}
+          EOF
+          for var in TREG_API_TOKEN OPENROUTER_API_KEY OPENROUTER_BASE_URL OPENROUTER_MODEL CONTEXT_API_KEY CRAWLER_ACCESS_SECRET OPENSEO_OPERATOR_SECRET; do
+            val="${!var}"
+            if [ -n "$val" ]; then
+              echo "${var}=${val}" >> .env.selfhost
+            fi
+          done
+
+      - name: Bootstrap Alchemy state store (idempotent)
+        if: steps.should_deploy.outputs.run == 'true'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: pnpm alchemy cloudflare bootstrap
+
+      - name: Deploy to Cloudflare
+        if: steps.should_deploy.outputs.run == 'true'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          NODE_OPTIONS: --max-old-space-size=8192
+        run: pnpm deploy:selfhost --yes
